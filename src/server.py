@@ -3,28 +3,42 @@ from __future__ import annotations
 import asyncio
 import binascii
 import os
-from typing import Dict, List, Optional
+import time
+from random import choice, randint, random, sample
+from typing import Dict, List, Optional, Annotated
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, conint, confloat
+from pydantic import BaseModel, Field
 import uvicorn
 
+# =========================
+# QKD / Crypto / Network imports (come nel tuo progetto)
+# =========================
 from network import build_network, QKDNode, NetworkState
 from crypto_utils import encrypt_gcm, decrypt_gcm
 from qkd import bb84_key_generation, e91_key_generation
 
 # =========================
+# Qiskit Aer — per replicare esattamente lo Scenario 4 del main
+# =========================
+from qiskit import QuantumCircuit, transpile
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel, depolarizing_error
+
+# =========================
 # FastAPI setup
 # =========================
-app = FastAPI(title="QKD Playground API", version="1.0.0", description="""
+app = FastAPI(title="QKD Playground API", version="1.1.0", description="""
 Agnostic backend for QKD demos.
 - REST for data/sweeps/management
 - WebSocket for chat & live protocol traces
+- Sweep QBER vs P(Eve) identical to 'main' Scenario 4 (with hardware noise + theory)
 """)
 
-# CORS wide open by default (restrict in prod)
+# CORS (aperto by default; restringi in prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -41,7 +55,6 @@ STATE: NetworkState = build_network(num_nodes=2)
 # =========================
 class ConnectionManager:
     def __init__(self):
-        # room per node_id -> set of websockets
         self.rooms: Dict[str, List[WebSocket]] = {}
 
     async def connect(self, ws: WebSocket, room: str):
@@ -72,54 +85,210 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # =========================
-# Pydantic models
+# Pydantic models & types
 # =========================
+IntGE0 = Annotated[int, Field(ge=0)]
+IntGE2 = Annotated[int, Field(ge=2)]
+IntGE2LE400 = Annotated[int, Field(ge=2, le=400)]
+IntBits = Annotated[int, Field(ge=8, le=8192)]
+IntKeyLen = Annotated[int, Field(ge=8, le=4096)]
+
+FloatGE0 = Annotated[float, Field(ge=0.0)]
+FloatGE0LE1 = Annotated[float, Field(ge=0.0, le=1.0)]
+FloatQBER = Annotated[float, Field(ge=0.0, le=0.5)]
+FloatGT0LE09 = Annotated[float, Field(gt=0.0, le=0.9)]
+
 class RebuildReq(BaseModel):
-    num_nodes: conint(ge=2) = 4
-    noise_min: confloat(ge=0.0) = 0.0
-    noise_max: confloat(ge=0.0) = 0.05
-    eve_prob: confloat(ge=0.0, le=1.0) = 0.0
+    num_nodes: IntGE2 = 4
+    noise_min: FloatGE0 = 0.0
+    noise_max: FloatGE0 = 0.05
+    eve_prob: FloatGE0LE1 = 0.0
     protocol: str = Field("bb84", description="bb84|e91|mixed")
 
-class SweepResp(BaseModel):
-    noise: List[float]
-    qber: List[float]
-    success: List[bool]
-
 class SweepParams(BaseModel):
-    noise_min: confloat(ge=0.0) = 0.0
-    noise_max: confloat(ge=0.0) = 0.12
-    num: conint(ge=2, le=400) = 25
-    n_bits: conint(ge=8, le=8192) = 256
-    eve: bool = False
+    # X axis = P(Eve) (identico al main Scenario 4)
+    noise_min: FloatGE0 = 0.0
+    noise_max: FloatGE0LE1 = 1.0
+    num: IntGE2LE400 = 15
+    n_bits: IntBits = 100               # KEY_LENGTH usato nel main per statistiche migliori
     protocol: str = "bb84"
+
+    # nuovi parametri per Scenario 4
+    hardware_noise: FloatGE0LE1 = 0.03  # prob. depolarizzante sui gate {X,H}
+    runs: IntGE2 = 3                    # media su N run per ogni punto
+    include_theory: bool = True         # curva teorica 0.25*P(Eve)
+    qber_cut: FloatQBER = 0.15          # stesso threshold del main
+
+class SweepResp(BaseModel):
+    noise: list[float]                         # P(Eve)
+    qber_ideal: list[float]                    # hardware 0%
+    qber_hardware: list[float]                 # hardware depolarizing
+    qber_theoretical: Optional[list[float]]    # 0.25*P(Eve), se richiesto
+    success_ideal: list[bool]                  # almeno una run ha prodotto key (post-cut)
+    success_hardware: list[bool]
 
 class EstablishReq(BaseModel):
-    src: conint(ge=0)
-    dst: conint(ge=0)
+    src: IntGE0
+    dst: IntGE0
     protocol: str = "bb84"
-    n_bits: conint(ge=8, le=8192) = 256
-    noise: confloat(ge=0.0) = 0.02
-    eve_prob: confloat(ge=0.0, le=1.0) = 0.0
-    qber_threshold: confloat(ge=0.0, le=0.5) = 0.11
+    n_bits: IntBits = 256
+    noise: FloatGE0 = 0.02
+    eve_prob: FloatGE0LE1 = 0.0
+    qber_threshold: FloatQBER = 0.11
 
 class ChatSend(BaseModel):
-    sender: conint(ge=0)
-    receiver: conint(ge=0)
+    sender: IntGE0
+    receiver: IntGE0
     message: str
 
 class DecryptReq(BaseModel):
-    owner: conint(ge=0)
-    peer: conint(ge=0)
+    owner: IntGE0
+    peer: IntGE0
     blob_hex: str
 
 class WorkbenchReq(BaseModel):
     protocol: str = Field("bb84", description="bb84|e91")
-    key_len: conint(ge=8, le=4096) = 64
-    noise: confloat(ge=0.0, le=1.0) = 0.0
-    eve_prob: confloat(ge=0.0, le=1.0) = 0.0
-    sample_frac: confloat(gt=0.0, le=0.9) = 0.5
-    seed: Optional[int] = None
+    key_len: IntKeyLen = 64
+    noise: FloatGE0LE1 = 0.0
+    eve_prob: FloatGE0LE1 = 0.0
+    sample_frac: FloatGT0LE09 = 0.5
+    seed: int | None = None
+
+# =========================
+# Helpers per replicare lo Scenario 4 (main)
+# =========================
+
+def create_hardware_noise_model(prob_depolarizing: float) -> Optional[NoiseModel]:
+    """
+    Stesso modello del main: errore depolarizzante su gate single-qubit {X,H}.
+    """
+    if prob_depolarizing <= 0.0:
+        return None
+    noise_model = NoiseModel()
+    error_1 = depolarizing_error(prob_depolarizing, 1)
+    # Applichiamo l'errore ai gate usati nella preparazione/rotazione
+    noise_model.add_quantum_error(error_1, ["x", "h"], [0])
+    return noise_model
+
+def _alice(q_channel: list, c_channel: dict, key_len: int):
+    bits = [randint(0, 1) for _ in range(key_len)]
+    bases = [choice(["Z", "X"]) for _ in range(key_len)]
+    q_channel.clear()
+    for i in range(key_len):
+        qc = QuantumCircuit(1, 1)
+        if bits[i] == 1:
+            qc.x(0)
+        if bases[i] == "X":
+            qc.h(0)
+        q_channel.append(qc)
+    # attende bob_bases e pubblica alice_bases
+    while "bob_bases" not in c_channel:
+        time.sleep(0.001)
+    c_channel["alice_bases"] = bases
+    # sift
+    sifted = [bits[i] for i in range(key_len) if bases[i] == c_channel["bob_bases"][i]]
+    return bits, sifted
+
+def _bob(q_channel: list, c_channel: dict, key_len: int, eve_intercept_prob: float, noise_model: Optional[NoiseModel]):
+    simulator = AerSimulator(noise_model=noise_model)
+
+    # Eve: intercept & resend su una frazione dei qubit, misurando Z/X a caso
+    if eve_intercept_prob > 0.0:
+        intercept_info = []
+        circuits_for_eve = []
+        for i in range(key_len):
+            if random() < eve_intercept_prob:
+                eve_basis = choice(["Z", "X"])
+                intercept_info.append((i, eve_basis))
+                qc = q_channel[i].copy()
+                if eve_basis == "X":
+                    qc.h(0)
+                qc.measure(0, 0)
+                circuits_for_eve.append(qc)
+        if circuits_for_eve:
+            transpiled_eve = transpile(circuits_for_eve, simulator)
+            result_eve = simulator.run(transpiled_eve, shots=1, memory=True).result()
+            measured_bits = [int(result_eve.get_memory(k)[0]) for k in range(len(circuits_for_eve))]
+            for (k, (orig_idx, eve_basis)) in enumerate(intercept_info):
+                b = measured_bits[k]
+                qc_for_bob = QuantumCircuit(1, 1)
+                if b == 1:
+                    qc_for_bob.x(0)
+                if eve_basis == "X":
+                    qc_for_bob.h(0)
+                q_channel[orig_idx] = qc_for_bob
+
+    # Bob sceglie le basi, misura tutto (anche mismatch di basi)
+    bob_bases = [choice(["Z", "X"]) for _ in range(key_len)]
+    circuits = []
+    for i in range(key_len):
+        qc = q_channel[i]
+        if bob_bases[i] == "X":
+            qc.h(0)
+        qc.measure(0, 0)
+        circuits.append(qc)
+    transpiled = transpile(circuits, simulator)
+    result = simulator.run(transpiled, shots=1, memory=True).result()
+    bob_results = [int(result.get_memory(i)[0]) for i in range(len(circuits))]
+
+    # Pubblica basi e attende Alice
+    c_channel["bob_bases"] = bob_bases
+    while "alice_bases" not in c_channel:
+        time.sleep(0.001)
+    alice_bases = c_channel["alice_bases"]
+
+    # Sift
+    sifted = [bob_results[i] for i in range(key_len) if bob_bases[i] == alice_bases[i]]
+    return bob_results, sifted
+
+def _estimate_qber(sifted_alice: List[int], sifted_bob: List[int], sample_frac: float = 0.5):
+    if not sifted_alice or not sifted_bob:
+        return 0.0, [], []
+    n = len(sifted_alice)
+    m = max(1, int(n * sample_frac))
+    idx = sorted(sample(range(n), m), reverse=True)
+    errors = 0
+    a = list(sifted_alice)
+    b = list(sifted_bob)
+    for i in idx:
+        if a.pop(i) != b.pop(i):
+            errors += 1
+    qber = errors / m
+    return qber, a, b  # a,b = chiavi finali dopo rimozione campioni
+
+def _run_simulation_once(key_len: int, eve_intercept_prob: float, noise_model: Optional[NoiseModel], qber_cut: float):
+    """
+    Identico nella logica al tuo main:
+    - genera canali,
+    - lancia alice/bob,
+    - stima QBER su metà dei bit sifted,
+    - scarta se qber > qber_cut (ritorna (qber, 0)), altrimenti (qber, len(final_key)).
+    """
+    q_channel: List[QuantumCircuit] = []
+    c_channel: Dict[str, List[int] | List[str]] = {}
+    results: Dict[str, tuple] = {}
+
+    import threading, time as _t
+
+    t_alice = threading.Thread(target=lambda: results.update({"alice": _alice(q_channel, c_channel, key_len)}))
+    t_bob = threading.Thread(target=lambda: results.update({"bob": _bob(q_channel, c_channel, key_len, eve_intercept_prob, noise_model)}))
+
+    t_alice.start()
+    _t.sleep(0.05)
+    t_bob.start()
+    t_alice.join()
+    t_bob.join()
+
+    if "alice" not in results or "bob" not in results:
+        return 0.0, 0
+
+    _, sifted_a = results["alice"]
+    _, sifted_b = results["bob"]
+    qber, final_a, final_b = _estimate_qber(sifted_a, sifted_b, sample_frac=0.5)
+
+    if qber > qber_cut:
+        return qber, 0
+    return qber, len(final_a)
 
 # =========================
 # Health & basic info
@@ -144,24 +313,70 @@ def get_metrics(node_id: int):
     return STATE.nodes[node_id].metrics
 
 # =========================
-# Section 1 — Sweep QBER vs Noise
+# Section 1 — Sweep QBER vs P(Eve) (identico al main Scenario 4)
 # =========================
 @app.post("/sweep", response_model=SweepResp)
 def sweep(params: SweepParams):
+    """
+    X = P(Eve) in [noise_min .. noise_max]
+    Y = QBER medio su 'runs' esecuzioni.
+    Due curve simulate (HW ideale, HW rumoroso) + curva teorica opzionale.
+    """
+    # Prepara modelli di rumore UNA sola volta (come nel main)
+    noise_model_ideal = create_hardware_noise_model(0.0)   # None
+    noise_model_hw    = create_hardware_noise_model(params.hardware_noise)
+
+    # griglia sull'asse X
     xs = [params.noise_min + i*(params.noise_max-params.noise_min)/(params.num-1) for i in range(params.num)]
-    qbers, succ = [], []
+
+    qber_ideal: List[float] = []
+    qber_hw: List[float] = []
+    success_ideal: List[bool] = []
+    success_hw: List[bool] = []
 
     for p in xs:
-        if params.protocol.lower() == "e91":
-            key, qber = e91_key_generation(n_bits=params.n_bits)
-        else:
-            key, qber = bb84_key_generation(
-                n_bits=params.n_bits, noise_level=p, eve=params.eve, raise_on_high_qber=False
+        # --- Ideal HW
+        q_samples = []
+        succ_any = False
+        for _ in range(params.runs):
+            q, keylen = _run_simulation_once(
+                key_len=params.n_bits,
+                eve_intercept_prob=p,
+                noise_model=noise_model_ideal,
+                qber_cut=params.qber_cut
             )
-        qbers.append(qber)
-        succ.append(bool(key))
+            q_samples.append(q)
+            succ_any = succ_any or (keylen > 0)
+        qber_ideal.append(float(np.mean(q_samples)))
+        success_ideal.append(bool(succ_any))
 
-    return SweepResp(noise=xs, qber=qbers, success=succ)
+        # --- Noisy HW
+        q_samples = []
+        succ_any = False
+        for _ in range(params.runs):
+            q, keylen = _run_simulation_once(
+                key_len=params.n_bits,
+                eve_intercept_prob=p,
+                noise_model=noise_model_hw,
+                qber_cut=params.qber_cut
+            )
+            q_samples.append(q)
+            succ_any = succ_any or (keylen > 0)
+        qber_hw.append(float(np.mean(q_samples)))
+        success_hw.append(bool(succ_any))
+
+    qber_theory = None
+    if params.include_theory and params.protocol.lower() == "bb84":
+        qber_theory = [0.25 * p for p in xs]
+
+    return SweepResp(
+        noise=xs,
+        qber_ideal=qber_ideal,
+        qber_hardware=qber_hw,
+        qber_theoretical=qber_theory,
+        success_ideal=success_ideal,
+        success_hardware=success_hw,
+    )
 
 # =========================
 # Section 2 — Network simulator + Secure Chat
@@ -182,7 +397,6 @@ def rebuild(req: RebuildReq):
 def establish(req: EstablishReq):
     if req.src not in STATE.nodes or req.dst not in STATE.nodes:
         return JSONResponse({"error": "unknown node"}, status_code=404)
-
     key, qber, proto = STATE.nodes[req.src].establish_key(
         neighbor=req.dst,
         protocol=req.protocol,
@@ -208,18 +422,8 @@ async def chat_send(payload: ChatSend):
     blob = encrypt_gcm(payload.message.encode("utf-8"), key)
     blob_hex = binascii.hexlify(blob).decode()
 
-    # push to receiver room over WS
-    await manager.send_room(str(r), {
-        "type": "secure_msg",
-        "sender": s,
-        "blob_hex": blob_hex
-    })
-    # also echo to sender room as delivery confirmation
-    await manager.send_room(str(s), {
-        "type": "delivered",
-        "to": r,
-        "blob_hex": blob_hex
-    })
+    await manager.send_room(str(r), {"type": "secure_msg", "sender": s, "blob_hex": blob_hex})
+    await manager.send_room(str(s), {"type": "delivered", "to": r, "blob_hex": blob_hex})
     return {"ok": True}
 
 @app.post("/chat/decrypt")
@@ -243,12 +447,7 @@ def chat_decrypt(payload: DecryptReq):
 @app.post("/workbench/run")
 def workbench_run(req: WorkbenchReq):
     """
-    Ritorna una TRACE dettagliata (adatta a un timeline viewer nel frontend):
-    - alice_bits, alice_bases, bob_bases
-    - bob_results
-    - sift_mask indices
-    - sample_indices per stima QBER
-    - qber, final_key_bits (post sample removal)
+    Ritorna una TRACE dettagliata (adatta al frontend per visualizzazione step-by-step).
     """
     from workbench import run_bb84_trace, run_e91_trace
     if req.protocol.lower() == "e91":
@@ -266,9 +465,9 @@ def workbench_run(req: WorkbenchReq):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    Client protocol (simple JSON):
+    Simple protocol:
     - {"action":"join","room":"<node_id or arbitrary>"}
-    - {"action":"send","room":"<room>","payload":{...}}  # echo to all in room
+    - {"action":"send","room":"<room>","payload":{...}}
     """
     room = None
     await websocket.accept()
@@ -297,5 +496,5 @@ async def websocket_endpoint(websocket: WebSocket):
 # Dev entry
 # =========================
 if __name__ == "__main__":
-    # HTTPS dev: pass --ssl-keyfile/--ssl-certfile to uvicorn if needed
+    # Avvio standard; per HTTPS usare --ssl-keyfile/--ssl-certfile con uvicorn.run CLI
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
