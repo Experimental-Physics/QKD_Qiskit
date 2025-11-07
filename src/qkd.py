@@ -41,7 +41,7 @@ def _bits_to_bytes(bits: List[int]) -> bytes:
     return bytes(out)
 
 def bb84_key_generation(n_bits: int = 256,
-                        noise_level: float = 0.0,
+                        noise_level: float = 0.1,
                         eve: bool = False,
                         qber_threshold: float = 0.11,
                         raise_on_high_qber: bool = False) -> Tuple[bytes | None, float]:
