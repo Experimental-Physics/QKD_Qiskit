@@ -34,7 +34,7 @@ app.add_middleware(
 # =========================
 # Global in-memory state
 # =========================
-STATE: NetworkState = build_network(num_nodes=4)
+STATE: NetworkState = build_network(num_nodes=2)
 
 # =========================
 # WebSocket connection manager
