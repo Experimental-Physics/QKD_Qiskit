@@ -14,15 +14,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
+from collections import deque
+from datetime import datetime, timezone
+
 # =========================
-# QKD / Crypto / Network imports (come nel tuo progetto)
+# QKD / Crypto / Network imports (project-local)
 # =========================
 from network import build_network, QKDNode, NetworkState
 from crypto_utils import encrypt_gcm, decrypt_gcm
 from qkd import bb84_key_generation, e91_key_generation
 
 # =========================
-# Qiskit Aer — per replicare esattamente lo Scenario 4 del main
+# Qiskit Aer — scenario 4
 # =========================
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
@@ -31,14 +34,15 @@ from qiskit_aer.noise import NoiseModel, depolarizing_error
 # =========================
 # FastAPI setup
 # =========================
-app = FastAPI(title="QKD Playground API", version="1.1.0", description="""
+app = FastAPI(title="QKD Playground API", version="1.2.0", description="""
 Agnostic backend for QKD demos.
 - REST for data/sweeps/management
 - WebSocket for chat & live protocol traces
 - Sweep QBER vs P(Eve) identical to 'main' Scenario 4 (with hardware noise + theory)
+- Rolling per-link histories for QBER/noise
 """)
 
-# CORS (aperto by default; restringi in prod)
+# CORS (open by default; restrict in prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -49,6 +53,36 @@ app.add_middleware(
 # Global in-memory state
 # =========================
 STATE: NetworkState = build_network(num_nodes=2)
+
+# Rolling histories per unordered node pair (u, v)
+# Each point: {"t": iso8601, "qber": float, "noise": float, "eve_prob": float, "success": bool, "key_len": int}
+MAX_HISTORY = 200
+HISTORY: Dict[tuple[int, int], deque] = {}
+
+def _pair(u: int, v: int) -> tuple[int, int]:
+    return (u, v) if u <= v else (v, u)
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _history_arrays(u: int, v: int):
+    key = _pair(u, v)
+    dq = HISTORY.get(key, deque())
+    t = [p["t"] for p in dq]
+    qber = [p["qber"] for p in dq]
+    noise = [p["noise"] for p in dq]
+    eve = [p["eve_prob"] for p in dq]
+    success = [p["success"] for p in dq]
+    key_len = [p["key_len"] for p in dq]
+    return {
+        "u": key[0], "v": key[1],
+        "timestamps": t,
+        "qber_history": qber,
+        "noise_history": noise,
+        "eve_prob_history": eve,
+        "success_history": success,
+        "keylen_history": key_len,
+    }
 
 # =========================
 # WebSocket connection manager
@@ -154,8 +188,12 @@ class WorkbenchReq(BaseModel):
     sample_frac: FloatGT0LE09 = 0.5
     seed: int | None = None
 
+class HistoryPairReq(BaseModel):
+    u: IntGE0
+    v: IntGE0
+
 # =========================
-# Helpers per replicare lo Scenario 4 (main)
+# Helpers — Scenario 4 (main)
 # =========================
 
 def create_hardware_noise_model(prob_depolarizing: float) -> Optional[NoiseModel]:
@@ -170,7 +208,7 @@ def create_hardware_noise_model(prob_depolarizing: float) -> Optional[NoiseModel
     noise_model.add_quantum_error(error_1, ["x", "h"], [0])
     return noise_model
 
-def _alice(q_channel: list, c_channel: dict, key_len: int):
+def _alice(q_channel: list, c_channel: dict, key_len: int, ready_evt):
     bits = [randint(0, 1) for _ in range(key_len)]
     bases = [choice(["Z", "X"]) for _ in range(key_len)]
     q_channel.clear()
@@ -181,6 +219,9 @@ def _alice(q_channel: list, c_channel: dict, key_len: int):
         if bases[i] == "X":
             qc.h(0)
         q_channel.append(qc)
+    # Signal Bob that q_channel is fully populated
+    ready_evt.set()
+
     # attende bob_bases e pubblica alice_bases
     while "bob_bases" not in c_channel:
         time.sleep(0.001)
@@ -189,8 +230,11 @@ def _alice(q_channel: list, c_channel: dict, key_len: int):
     sifted = [bits[i] for i in range(key_len) if bases[i] == c_channel["bob_bases"][i]]
     return bits, sifted
 
-def _bob(q_channel: list, c_channel: dict, key_len: int, eve_intercept_prob: float, noise_model: Optional[NoiseModel]):
+def _bob(q_channel: list, c_channel: dict, key_len: int, eve_intercept_prob: float, noise_model: Optional[NoiseModel], ready_evt):
     simulator = AerSimulator(noise_model=noise_model)
+
+    # Wait until Alice has populated all circuits to avoid race on q_channel[i].
+    ready_evt.wait()
 
     # Eve: intercept & resend su una frazione dei qubit, misurando Z/X a caso
     if eve_intercept_prob > 0.0:
@@ -200,7 +244,7 @@ def _bob(q_channel: list, c_channel: dict, key_len: int, eve_intercept_prob: flo
             if random() < eve_intercept_prob:
                 eve_basis = choice(["Z", "X"])
                 intercept_info.append((i, eve_basis))
-                qc = q_channel[i].copy()
+                qc = q_channel[i].copy()  # safe after ready_evt
                 if eve_basis == "X":
                     qc.h(0)
                 qc.measure(0, 0)
@@ -258,7 +302,7 @@ def _estimate_qber(sifted_alice: List[int], sifted_bob: List[int], sample_frac: 
 
 def _run_simulation_once(key_len: int, eve_intercept_prob: float, noise_model: Optional[NoiseModel], qber_cut: float):
     """
-    Identico nella logica al tuo main:
+    Identico nella logica al main:
     - genera canali,
     - lancia alice/bob,
     - stima QBER su metà dei bit sifted,
@@ -267,14 +311,15 @@ def _run_simulation_once(key_len: int, eve_intercept_prob: float, noise_model: O
     q_channel: List[QuantumCircuit] = []
     c_channel: Dict[str, List[int] | List[str]] = {}
     results: Dict[str, tuple] = {}
+    import threading
 
-    import threading, time as _t
+    ready_evt = threading.Event()
 
-    t_alice = threading.Thread(target=lambda: results.update({"alice": _alice(q_channel, c_channel, key_len)}))
-    t_bob = threading.Thread(target=lambda: results.update({"bob": _bob(q_channel, c_channel, key_len, eve_intercept_prob, noise_model)}))
+    t_alice = threading.Thread(target=lambda: results.update({"alice": _alice(q_channel, c_channel, key_len, ready_evt)}))
+    t_bob = threading.Thread(target=lambda: results.update({"bob": _bob(q_channel, c_channel, key_len, eve_intercept_prob, noise_model, ready_evt)}))
 
     t_alice.start()
-    _t.sleep(0.05)
+    # Slight stagger is fine but no longer necessary due to ready_evt.
     t_bob.start()
     t_alice.join()
     t_bob.join()
@@ -299,11 +344,18 @@ def health():
 
 @app.get("/network")
 def get_network():
+    # Build per-edge history summary
+    hist = {}
+    for (u, v), _dq in HISTORY.items():
+        arr = _history_arrays(u, v)
+        hist[f"{u}-{v}"] = arr
+
     return {
         "num_nodes": len(STATE.nodes),
         "edges": list(STATE.graph.edges),
         "keys": {u: list(n.keys.keys()) for u, n in STATE.nodes.items()},
         "metrics": {u: n.metrics for u, n in STATE.nodes.items()},
+        "history": hist,
     }
 
 @app.get("/metrics/{node_id}")
@@ -313,7 +365,7 @@ def get_metrics(node_id: int):
     return STATE.nodes[node_id].metrics
 
 # =========================
-# Section 1 — Sweep QBER vs P(Eve) (identico al main Scenario 4)
+# Section 1 — Sweep QBER vs P(Eve)
 # =========================
 @app.post("/sweep", response_model=SweepResp)
 def sweep(params: SweepParams):
@@ -322,7 +374,7 @@ def sweep(params: SweepParams):
     Y = QBER medio su 'runs' esecuzioni.
     Due curve simulate (HW ideale, HW rumoroso) + curva teorica opzionale.
     """
-    # Prepara modelli di rumore UNA sola volta (come nel main)
+    # Prepara modelli di rumore UNA sola volta
     noise_model_ideal = create_hardware_noise_model(0.0)   # None
     noise_model_hw    = create_hardware_noise_model(params.hardware_noise)
 
@@ -383,7 +435,7 @@ def sweep(params: SweepParams):
 # =========================
 @app.post("/rebuild")
 def rebuild(req: RebuildReq):
-    global STATE
+    global STATE, HISTORY
     protocol_choice = req.protocol.lower()
     STATE = build_network(
         num_nodes=req.num_nodes,
@@ -391,10 +443,11 @@ def rebuild(req: RebuildReq):
         eve_prob=req.eve_prob,
         default_protocol=protocol_choice,
     )
+    HISTORY = {}  # reset histories when topology changes
     return {"ok": True, "num_nodes": req.num_nodes}
 
 @app.post("/establish")
-def establish(req: EstablishReq):
+async def establish(req: EstablishReq):
     if req.src not in STATE.nodes or req.dst not in STATE.nodes:
         return JSONResponse({"error": "unknown node"}, status_code=404)
     key, qber, proto = STATE.nodes[req.src].establish_key(
@@ -405,41 +458,53 @@ def establish(req: EstablishReq):
         eve_prob=req.eve_prob,
         qber_threshold=req.qber_threshold
     )
+
+    # ---- Persist history
+    u, v = _pair(req.src, req.dst)
+    dq = HISTORY.setdefault((u, v), deque(maxlen=MAX_HISTORY))
+    point = {
+        "t": _now_iso(),
+        "qber": float(qber if qber is not None else 0.0),
+        "noise": float(req.noise),
+        "eve_prob": float(req.eve_prob),
+        "success": bool(key is not None),
+        "key_len": int(len(key) if key is not None else 0),
+    }
+    dq.append(point)
+
+    # WS update to both rooms
+    payload = {"type": "history_update", "pair": [u, v], "data": _history_arrays(u, v)}
+    await manager.send_room(str(u), payload)
+    await manager.send_room(str(v), payload)
+
     if key is None:
         return {"ok": False, "qber": qber, "protocol": proto, "message": "QBER too high or failed"}
     return {"ok": True, "qber": qber, "protocol": proto}
 
-@app.post("/chat/send")
-async def chat_send(payload: ChatSend):
-    s = payload.sender
-    r = payload.receiver
-    if s not in STATE.nodes or r not in STATE.nodes:
-        return JSONResponse({"error": "unknown node"}, status_code=404)
-    if r not in STATE.nodes[s].keys:
-        return JSONResponse({"error": "no secure channel"}, status_code=400)
+@app.get("/history")
+def history_all():
+    """Return history arrays for all recorded pairs."""
+    out = {}
+    for (u, v) in HISTORY.keys():
+        out[f"{u}-{v}"] = _history_arrays(u, v)
+    return out
 
-    key, _, _ = STATE.nodes[s].keys[r]
-    blob = encrypt_gcm(payload.message.encode("utf-8"), key)
-    blob_hex = binascii.hexlify(blob).decode()
+@app.get("/history/{u}/{v}")
+def history_pair(u: int, v: int):
+    """Return history arrays for a specific pair."""
+    return _history_arrays(u, v)
 
-    await manager.send_room(str(r), {"type": "secure_msg", "sender": s, "blob_hex": blob_hex})
-    await manager.send_room(str(s), {"type": "delivered", "to": r, "blob_hex": blob_hex})
-    return {"ok": True}
-
-@app.post("/chat/decrypt")
-def chat_decrypt(payload: DecryptReq):
-    o = payload.owner
-    p = payload.peer
-    if o not in STATE.nodes or p not in STATE.nodes:
-        return JSONResponse({"error": "unknown node"}, status_code=404)
-    if p not in STATE.nodes[o].keys:
-        return JSONResponse({"error": "no secure channel"}, status_code=400)
-    key, _, _ = STATE.nodes[o].keys[p]
-    try:
-        pt = decrypt_gcm(binascii.unhexlify(payload.blob_hex), key)
-    except Exception as e:
-        return JSONResponse({"error": f"decrypt failed: {e}"}, status_code=400)
-    return {"ok": True, "plaintext": pt.decode("utf-8")}
+@app.post("/history/reset")
+def history_reset(req: Optional[HistoryPairReq] = None):
+    """Reset all histories or just one pair."""
+    global HISTORY
+    if req is None or (getattr(req, "u", None) is None or getattr(req, "v", None) is None):
+        HISTORY = {}
+        return {"ok": True, "cleared": "all"}
+    key = _pair(req.u, req.v)
+    if key in HISTORY:
+        del HISTORY[key]
+    return {"ok": True, "cleared": f"{key[0]}-{key[1]}"}
 
 # =========================
 # Section 3 — Protocol Workbench (step trace)
@@ -496,5 +561,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # Dev entry
 # =========================
 if __name__ == "__main__":
-    # Avvio standard; per HTTPS usare --ssl-keyfile/--ssl-certfile con uvicorn.run CLI
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    # For local dev; in production (e.g., Render), Gunicorn handles via Procfile.
+    # Use --workers=1 in Procfile for single-process state sharing.
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=True)
