@@ -10,51 +10,40 @@ import numpy as np
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 
-# We will use simple list and dict as our "connections"
-# q_channel: A list shared between Alice and Bob, holding QuantumCircuits (the "qubits")
-# c_channel: A dict shared between Alice and Bob, holding public classical messages
-#            (e.g., 'bob_bases', 'alice_bases')
+# --- NUOVO IMPORT PER IL RUMORE ---
+from qiskit_aer.noise import NoiseModel, depolarizing_error
+
+# (Il resto delle funzioni 'alice', 'estimate_qber' rimane invariato)
+# ... (Puoi copiare le tue funzioni 'alice' e 'estimate_qber' qui) ...
 
 
 def alice(q_channel, c_channel, key_len=10):
     """
     Alice's side of the protocol.
-    1. Generates her bits and bases.
-    2. Creates and "sends" qubits (QuantumCircuits) via the q_channel.
-    3. Waits for Bob to publish his bases on the c_channel.
-    4. Publishes her own bases on the c_channel.
-    5. Sifts her key based on matching bases.
-    6. Returns her original bits and her final sifted key.
+    (Questa funzione è invariata rispetto alla tua versione)
     """
     print(f"[Alice] Starting. Generating {key_len} bits and bases.")
 
     # 1. Generate bits and bases
-    #    'Z' basis = Rectilinear (|0>, |1>)
-    #    'X' basis = Diagonal (|+>, |->)
     alice_bits = [randint(0, 1) for _ in range(key_len)]
     alice_bases = [choice(["Z", "X"]) for _ in range(key_len)]
 
     # 2. Create and "send" qubits
-    q_channel.clear()  # Clear the channel for this new transmission
+    q_channel.clear()
     for i in range(key_len):
         qc = QuantumCircuit(1, 1)
-
-        # Encode bit: 1 -> apply X gate
         if alice_bits[i] == 1:
             qc.x(0)
-
-        # Encode basis: 'X' -> apply H gate
         if alice_bases[i] == "X":
             qc.h(0)
-
-        q_channel.append(qc)  # "Send" the prepared qubit
+        q_channel.append(qc)
 
     print(f"[Alice] Sent {len(q_channel)} qubits on the quantum channel.")
 
     # 3. Wait for Bob's bases
     print("[Alice] Waiting for Bob to publish his bases on the classical channel...")
     while "bob_bases" not in c_channel:
-        time.sleep(0.1)  # Wait for Bob to finish measuring
+        time.sleep(0.1)
 
     bob_bases = c_channel["bob_bases"]
     print("[Alice] Received Bob's bases.")
@@ -69,108 +58,105 @@ def alice(q_channel, c_channel, key_len=10):
             sifted_alice_key.append(alice_bits[i])
 
     print(f"[Alice] Sifted key: {''.join(map(str, sifted_alice_key))}")
-
-    # Return both for analysis
     return alice_bits, sifted_alice_key
 
 
-def bob(q_channel, c_channel, key_len=10, noise_level=0.0):
+# --- NUOVA FUNZIONE PER CREARE IL MODELLO DI RUMORE QISKIT ---
+def create_hardware_noise_model(prob_depolarizing):
     """
-    Bob's side of the protocol. (Optimized version)
-    1. Simulates Eve/Noise by intercepting/modifying the q_channel in a single batch.
-    2. Generates his own random bases.
-    3. Measures the received qubits (circuits) using his bases in a single batch.
-    4. Publishes his bases on the c_channel.
-    5. Waits for Alice to publish her bases.
-    6. Sifts his key.
-    7. Returns his measurement results and his final sifted key.
+    Crea un semplice modello di rumore hardware (rumore depolarizzante)
+    da applicare ai gate single-qubit.
     """
-    print(f"[Bob] Starting. (Noise/Eve level: {noise_level * 100}%)")
+    if prob_depolarizing == 0:
+        return None  # Nessun rumore
 
-    # Use a single simulator instance
-    simulator = AerSimulator()
+    # L'errore depolarizzante simula una perdita generica di coerenza
+    error_1 = depolarizing_error(prob_depolarizing, 1)
 
-    # 1. Simulate Eve/Noise
-    if noise_level > 0:
+    # Crea un modello di rumore vuoto
+    noise_model = NoiseModel()
+
+    # Applica questo errore a tutti i gate single-qubit che Alice usa
+    noise_model.add_quantum_error(error_1, ["x", "h"], [0])
+
+    print(
+        f"[Noise] Created hardware noise model with {prob_depolarizing * 100:.1f}% depolarizing error on X and H gates."
+    )
+    return noise_model
+
+
+# --- FUNZIONE 'bob' MODIFICATA ---
+def bob(q_channel, c_channel, key_len=10, eve_intercept_prob=0.0, noise_model=None):
+    """
+    Bob's side of the protocol.
+    Ora accetta:
+    - eve_intercept_prob: La probabilità che Eve esegua un attacco (ex 'noise_level')
+    - noise_model: Il modello di rumore hardware di Qiskit
+    """
+    print(f"[Bob] Starting. (Eve Intercept Prob: {eve_intercept_prob * 100}%)")
+
+    # --- MODIFICA: Il simulatore ora accetta il modello di rumore ---
+    simulator = AerSimulator(noise_model=noise_model)
+
+    # 1. Simulate Eve/Noise (attacco 'intercept-and-resend')
+    # (Questa logica è ottimizzata e usa 'eve_intercept_prob')
+    if eve_intercept_prob > 0:
         print("[Bob/Eve] Eavesdropper is intercepting the quantum channel...")
-
-        # --- OTTIMIZZAZIONE: Preparazione del Batch di Eve ---
-        intercept_info = []  # Lista per salvare (index, eve_basis)
-        circuits_for_eve = []  # Lista per i circuiti da simulare
+        intercept_info = []
+        circuits_for_eve = []
 
         for i in range(key_len):
-            if random() < noise_level:  # Eve intercetta questo qubit
+            if random() < eve_intercept_prob:  # Eve intercetta
                 eve_basis = choice(["Z", "X"])
-
-                # Salviamo le info per dopo
                 intercept_info.append({"index": i, "basis": eve_basis})
-
-                # IMPORTANTE: Copiamo il circuito per non modificare l'originale
-                # Altrimenti, le misurazioni di Eve "inquinano" quelle di Bob
                 qc_from_alice = q_channel[i].copy()
-
-                # Aggiungiamo le porte di misurazione di Eve
                 if eve_basis == "X":
                     qc_from_alice.h(0)
                 qc_from_alice.measure(0, 0)
-
                 circuits_for_eve.append(qc_from_alice)
 
-        # --- OTTIMIZZAZIONE: Esecuzione del Batch di Eve (una sola volta) ---
-        if circuits_for_eve:  # Solo se Eve ha intercettato qualcosa
+        if circuits_for_eve:
             print(
                 f"[Bob/Eve] Eve is measuring {len(circuits_for_eve)} qubits in one batch..."
             )
+            # IMPORTANTE: La simulazione di Eve è ORA influenzata dal rumore hardware!
             transpiled_eve = transpile(circuits_for_eve, simulator)
             result_eve = simulator.run(transpiled_eve, shots=1, memory=True).result()
-
-            # Otteniamo tutti i bit misurati da Eve
             measured_bits = [
                 int(result_eve.get_memory(k)[0]) for k in range(len(circuits_for_eve))
             ]
 
-            # --- OTTIMIZZAZIONE: Ricostruzione dei qubit per Bob ---
             for k, info in enumerate(intercept_info):
                 original_index = info["index"]
                 eve_basis = info["basis"]
                 eve_measured_bit = measured_bits[k]
-
-                # Eve crea un *nuovo* qubit da inviare a Bob
                 qc_for_bob = QuantumCircuit(1, 1)
                 if eve_measured_bit == 1:
                     qc_for_bob.x(0)
                 if eve_basis == "X":
                     qc_for_bob.h(0)
-
-                # Sostituiamo il qubit originale con quello di Eve
                 q_channel[original_index] = qc_for_bob
 
     # 2. Generate Bob's bases
     print(f"[Bob] Receiving {len(q_channel)} qubits...")
     bob_bases = [choice(["Z", "X"]) for _ in range(key_len)]
 
-    # 3. Measure qubits (Questo era già ottimizzato in un batch)
+    # 3. Measure qubits
     circuits_to_run = []
     for i in range(key_len):
-        qc = q_channel[i]  # Get the (potentially tampered) qubit
-
-        # Add Bob's measurement gates
+        qc = q_channel[i]
         if bob_bases[i] == "X":
             qc.h(0)
         qc.measure(0, 0)
         circuits_to_run.append(qc)
 
-    # Run all measurements in one batch
+    # IMPORTANTE: Anche la simulazione di Bob è influenzata dallo stesso rumore hardware
     transpiled_circuits = transpile(circuits_to_run, simulator)
     result = simulator.run(transpiled_circuits, shots=1, memory=True).result()
 
-    # --- THIS IS THE FIX ---
-    # We must explicitly get the memory for EACH circuit by its index
     bob_results = []
     for i in range(len(circuits_to_run)):
-        # get_memory(i) returns a list (e.g., ['0'] or ['1']) since shots=1
         bob_results.append(int(result.get_memory(i)[0]))
-    # --- END FIX ---
 
     print(f"[Bob] Measured results: {''.join(map(str, bob_results))}")
 
@@ -193,14 +179,12 @@ def bob(q_channel, c_channel, key_len=10, noise_level=0.0):
             sifted_bob_key.append(bob_results[i])
 
     print(f"[Bob] Sifted key: {''.join(map(str, sifted_bob_key))}")
-
     return bob_results, sifted_bob_key
 
 
 def estimate_qber(sifted_alice, sifted_bob, sample_size=0.5):
     """
-    Alice and Bob publicly compare a sample of their sifted keys
-    to estimate the Quantum Bit Error Rate (QBER).
+    (Questa funzione è invariata rispetto alla tua versione)
     """
     if not sifted_alice or not sifted_bob:
         return 0.0, [], []
@@ -210,24 +194,20 @@ def estimate_qber(sifted_alice, sifted_bob, sample_size=0.5):
         print("[QBER] Sifted key is too short to sample. Aborting.")
         return 0.0, [], []
 
-    # Randomly choose indices to compare
     sample_indices = sample(range(len(sifted_alice)), num_samples)
-    sample_indices.sort(reverse=True)  # Sort to pop from the end
+    sample_indices.sort(reverse=True)
 
     print(f"[QBER] Comparing {num_samples} bits to estimate error rate...")
-
     errors = 0
     final_alice = list(sifted_alice)
     final_bob = list(sifted_bob)
 
-    # For each sample, compare and *discard* the bit
     for i in sample_indices:
         alice_sample_bit = final_alice.pop(i)
         bob_sample_bit = final_bob.pop(i)
         if alice_sample_bit != bob_sample_bit:
             errors += 1
 
-    # Gestione divisione per zero se num_samples è 0 (anche se già gestito sopra)
     if num_samples == 0:
         return 0.0, final_alice, final_bob
 
@@ -235,40 +215,32 @@ def estimate_qber(sifted_alice, sifted_bob, sample_size=0.5):
     return qber, final_alice, final_bob
 
 
-def run_simulation(key_len, noise_level):
+# --- FUNZIONE 'run_simulation' MODIFICATA ---
+def run_simulation(key_len, eve_intercept_prob, noise_model):
     """
-    Runs a single simulation of the BB84 protocol using threads
-    for Alice and Bob to "talk".
+    Runs a single simulation.
+    Ora passa 'eve_intercept_prob' e 'noise_model' a Bob.
     """
-
-    q_channel = []  # Represents the quantum channel
-    c_channel = {}  # Represents the public classical channel
-
-    # We use a dict to store results from the threads
+    q_channel = []
+    c_channel = {}
     results = {}
 
-    # Create threads
     alice_thread = threading.Thread(
         target=lambda: results.update({"alice": alice(q_channel, c_channel, key_len)})
     )
+    # --- MODIFICA: Passa i nuovi parametri a bob ---
     bob_thread = threading.Thread(
         target=lambda: results.update(
-            {"bob": bob(q_channel, c_channel, key_len, noise_level)}
+            {"bob": bob(q_channel, c_channel, key_len, eve_intercept_prob, noise_model)}
         )
     )
 
-    # Start threads
     alice_thread.start()
-    time.sleep(0.1)  # Give Alice a tiny head start to prepare qubits
+    time.sleep(0.1)
     bob_thread.start()
-
-    # Wait for them to finish
     alice_thread.join()
     bob_thread.join()
 
-    # --- Protocol Finished. Now analyze. ---
-
-    # Gestione di un raro caso in cui un thread potrebbe non aver restituito risultati
     if "alice" not in results or "bob" not in results:
         print("[Error] A thread failed to return results. Aborting run.")
         return 0.0, 0
@@ -284,7 +256,6 @@ def run_simulation(key_len, noise_level):
         f"Bob Sifted Key   ({len(sifted_bob_key)}): {''.join(map(str, sifted_bob_key))}"
     )
 
-    # Estimate QBER
     qber, final_alice, final_bob = estimate_qber(sifted_alice_key, sifted_bob_key)
 
     print("\n--- Final Analysis ---")
@@ -293,10 +264,9 @@ def run_simulation(key_len, noise_level):
     print(f"Final Key Length:      {len(final_alice)}")
     print(f"Quantum Bit Error Rate (QBER): {qber:.2%}")
 
-    # This is the security guarantee
-    if qber > 0.15:  # Theoretical max is 25%, but we set a lower security threshold
+    if qber > 0.15:
         print("!! QBER IS TOO HIGH! EAVESDROPPING DETECTED. KEY DISCARDED. !!")
-        return qber, 0  # Return QBER and final key length
+        return qber, 0
     else:
         print(">> QBER is low. Secure key established.")
         print(f">> Final Shared Key:  {''.join(map(str, final_alice))}")
@@ -304,60 +274,127 @@ def run_simulation(key_len, noise_level):
         return qber, len(final_alice)
 
 
-# Main execution
+# --- FUNZIONE 'main' MODIFICATA PER GESTIRE I NUOVI PARAMETRI ---
 def main():
-    KEY_LENGTH = 40  # Number of qubits to send
+    # Aumentiamo KEY_LENGTH per vedere meglio l'effetto statistico del rumore
+    # NOTA: questo renderà l'esecuzione più lenta! Riduci 'range(3)' sotto se troppo lento.
+    KEY_LENGTH = 100  # Number of qubits to send
 
-    # --- Scenario 1: Secure Channel ---
-    print("=================================================")
-    print(f" SCENARIO 1: Secure Channel (Noise = 0.0) ")
-    print("=================================================")
-    run_simulation(key_len=KEY_LENGTH, noise_level=0.0)
+    # --- Definiamo i nostri due nuovi parametri di rumore ---
+    EVE_PROB_SCENARIO_2 = 1.0  # Per lo Scenario 2 (attacco totale)
+    HARDWARE_NOISE_NONE = 0.0  # 0% rumore hardware
+    HARDWARE_NOISE_REALISTIC = 0.03  # 3% rumore hardware
 
-    # --- Scenario 2: Full Eavesdropping ---
+    # Creiamo i modelli di rumore UNA SOLA VOLTA
+    noise_model_none = create_hardware_noise_model(HARDWARE_NOISE_NONE)  # Ritorna None
+    noise_model_realistic = create_hardware_noise_model(HARDWARE_NOISE_REALISTIC)
+
+    # --- Scenario 1: Canale sicuro E hardware ideale ---
+    print("=================================================")
+    print(f" SCENARIO 1: Secure Channel (Eve=0%) + Ideal Hardware (Noise=0%) ")
+    print("=================================================")
+    run_simulation(
+        key_len=KEY_LENGTH, eve_intercept_prob=0.0, noise_model=noise_model_none
+    )
+
+    # --- Scenario 2: Attacco totale MA hardware ideale ---
     print("\n=================================================")
-    print(f" SCENARIO 2: Eve Intercepts All (Noise = 1.0) ")
+    print(f" SCENARIO 2: Full Eavesdropping (Eve=100%) + Ideal Hardware (Noise=0%) ")
     print("=================================================")
-    run_simulation(key_len=KEY_LENGTH, noise_level=1.0)
+    run_simulation(
+        key_len=KEY_LENGTH,
+        eve_intercept_prob=EVE_PROB_SCENARIO_2,
+        noise_model=noise_model_none,
+    )
 
-    # --- Scenario 3: Plotting QBER vs. Noise ---
+    # --- Scenario 3: Canale sicuro MA hardware rumoroso ---
     print("\n=================================================")
-    print(" SCENARIO 3: Plotting QBER vs. Noise Level ")
+    print(
+        f" SCENARIO 3: Secure Channel (Eve=0%) + Realistic Hardware (Noise={HARDWARE_NOISE_REALISTIC * 100}%) "
+    )
+    print("=================================================")
+    run_simulation(
+        key_len=KEY_LENGTH, eve_intercept_prob=0.0, noise_model=noise_model_realistic
+    )
+
+    # --- Scenario 4: Plotting QBER vs. Eve (confrontando hardware ideale e rumoroso) ---
+    print("\n=================================================")
+    print(" SCENARIO 4: Plotting QBER vs. Eve Interception ")
     print("=================================================")
     print("Running multiple simulations... (This may take a moment)")
 
-    noise_levels = np.linspace(0, 1, 20)
-    avg_qbers = []
+    # L'asse X è la probabilità di intercettazione di Eve
+    eve_prob_levels = np.linspace(0, 1, 15)  # 15 punti per il grafico
+    avg_qbers_ideal_hw = []
+    avg_qbers_noisy_hw = []
 
-    for noise in noise_levels:
-        print(f"Simulating noise level: {noise:.2f}")
-        qbers = []
-        for _ in range(5):  # Average over 5 runs for smoother data
-            qber, _ = run_simulation(key_len=KEY_LENGTH, noise_level=noise)
-            qbers.append(qber)
-        avg_qbers.append(np.mean(qbers))
+    # Eseguiamo la simulazione per entrambi i modelli di hardware
+    for eve_prob in eve_prob_levels:
+        print(f"\nSimulating Eve Intercept Prob: {eve_prob:.2f}")
+
+        # 1. Esegui con hardware IDEALE
+        print(f"... simulating ideal hardware (0% noise)...")
+        qbers_ideal = []
+        for _ in range(3):  # Media su 3 run per velocità
+            qber, _ = run_simulation(
+                key_len=KEY_LENGTH,
+                eve_intercept_prob=eve_prob,
+                noise_model=noise_model_none,
+            )
+            qbers_ideal.append(qber)
+        avg_qbers_ideal_hw.append(np.mean(qbers_ideal))
+
+        # 2. Esegui con hardware RUMOROSO
+        print(
+            f"... simulating noisy hardware ({HARDWARE_NOISE_REALISTIC * 100}% noise)..."
+        )
+        qbers_noisy = []
+        for _ in range(3):  # Media su 3 run per velocità
+            qber, _ = run_simulation(
+                key_len=KEY_LENGTH,
+                eve_intercept_prob=eve_prob,
+                noise_model=noise_model_realistic,
+            )
+            qbers_noisy.append(qber)
+        avg_qbers_noisy_hw.append(np.mean(qbers_noisy))
 
     # Plotting
+    plt.figure(figsize=(10, 7))
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(noise_levels, avg_qbers, "bo-", label="Simulated QBER")
+    # Linea 1: Hardware Ideale (dovrebbe partire da QBER=0)
     plt.plot(
-        noise_levels,
-        noise_levels * 0.25,
-        "r--",
-        label="Theoretical QBER (Noise * 0.25)",
+        eve_prob_levels,
+        avg_qbers_ideal_hw,
+        "bo-",
+        label="Simulated QBER (Ideal Hardware, 0% Noise)",
     )
 
-    plt.title("BB84: QBER vs. Eve Interception Probability")
-    plt.xlabel("Eve Interception Probability (Noise Level)")
+    # Linea 2: Hardware Rumoroso (dovrebbe partire da QBER > 0)
+    plt.plot(
+        eve_prob_levels,
+        avg_qbers_noisy_hw,
+        "go-",
+        label=f"Simulated QBER ({HARDWARE_NOISE_REALISTIC * 100}% Hardware Noise)",
+    )
+
+    # Linea 3: Limite teorico (solo Eve)
+    plt.plot(
+        eve_prob_levels,
+        eve_prob_levels * 0.25,
+        "r--",
+        label="Theoretical QBER (Eve-only, 0.25 * P(Eve))",
+    )
+
+    plt.title("BB84: QBER vs. Eve Interception (with Hardware Noise)")
+    plt.xlabel("Eve Interception Probability (eve_intercept_prob)")
     plt.ylabel("Quantum Bit Error Rate (QBER)")
     plt.legend()
     plt.grid(True)
+    plt.ylim(bottom=0)  # Forza l'asse Y a partire da 0
 
-    # Salva il grafico invece di tentare di mostrarlo
-    filename = "bb84_qber_vs_noise.png"
+    filename = "bb84_qber_vs_noise_comparison.png"
     plt.savefig(filename)
-    print(f"\n[Plotting] Grafico salvato come: {filename}")
+    print(f"\n[Plotting] Grafico di confronto salvato come: {filename}")
 
 
 if __name__ == "__main__":
