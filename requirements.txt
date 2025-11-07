@@ -1,0 +1,12 @@
+flask
+flask-socketio
+eventlet
+cryptography
+qiskit
+qiskit-aer
+networkx
+streamlit
+plotly
+matplotlib
+numpy
+torch
