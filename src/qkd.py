@@ -1,4 +1,4 @@
-# qkd.py
+# qkd.py (fast BB84)
 from __future__ import annotations
 import random
 from hashlib import sha256
@@ -6,31 +6,30 @@ from typing import Tuple, List
 
 import numpy as np
 from qiskit import QuantumCircuit, transpile
-from qiskit_aer import Aer, AerSimulator
+from qiskit_aer import AerSimulator
 from qiskit_aer.noise import NoiseModel, depolarizing_error
 
-# ------------------------ QRNG ------------------------
+# --- create simulator & noise once ---
+_NOISE = NoiseModel()
+# we’ll attach gate noise names once at import; tweak level at call time via parameter on gates
+# (Aer doesn’t let you change error probs on-the-fly; simplest is rebuild NoiseModel if you vary it a lot)
+def _make_noise_model(p: float) -> NoiseModel:
+    nm = NoiseModel()
+    if p > 0:
+        err = depolarizing_error(p, 1)
+        for g in ["x", "h", "id"]:
+            nm.add_all_qubit_quantum_error(err, g)
+    return nm
 
-def qrng(n: int) -> str:
-    """
-    Quantum RNG using Qiskit backend.run() (execute() deprecated).
-    Returns a bitstring of length n.
-    """
-    qc = QuantumCircuit(n, n)
-    qc.h(range(n))
-    qc.measure(range(n), range(n))
+# keep one simulator; we’ll swap noise by constructing a new simulator when p changes
+_SIM_CACHE: dict[float, AerSimulator] = {}
+def _sim_for_noise(p: float) -> AerSimulator:
+    if p not in _SIM_CACHE:
+        _SIM_CACHE[p] = AerSimulator(noise_model=_make_noise_model(p))
+        # you can also try: _SIM_CACHE[p].set_options(max_parallel_threads=0)  # use all cores
+    return _SIM_CACHE[p]
 
-    backend = Aer.get_backend("qasm_simulator")  # modern Qiskit Aer backend
-    job = backend.run(qc, shots=1)
-    result = job.result()
-
-    bits = list(result.get_counts().keys())[0]
-    return bits[::-1]  # reverse ordering
-
-# ------------------------ Utility ------------------------
-
-def bits_to_bytes(bits: List[int]) -> bytes:
-    """Converte una lista di bit [0/1] in bytes (padding a multipli di 8)."""
+def _bits_to_bytes(bits: List[int]) -> bytes:
     pad = (-len(bits)) % 8
     bits_padded = bits + [0]*pad
     out = bytearray()
@@ -41,90 +40,96 @@ def bits_to_bytes(bits: List[int]) -> bytes:
         out.append(byte)
     return bytes(out)
 
-# ------------------------ BB84 ------------------------
-
 def bb84_key_generation(n_bits: int = 256,
                         noise_level: float = 0.0,
                         eve: bool = False,
                         qber_threshold: float = 0.11,
                         raise_on_high_qber: bool = False) -> Tuple[bytes | None, float]:
     """
-    Simulazione BB84 base con rumore depolarizzante a 1 qubit.
-    Ritorna (chiave AES-128 derivata o None se QBER alto, QBER stimato).
-
-    Se raise_on_high_qber=True, solleva ValueError quando QBER supera qber_threshold.
+    Fast BB84 with chunking to avoid CircuitTooWideForTarget.
+    Builds multiple n_chunk-qubit circuits if needed, runs each once,
+    then concatenates results.
     """
-    # 1) Alice: bit e basi
-    alice_bits = [random.randint(0, 1) for _ in range(n_bits)]
-    alice_bases = [random.randint(0, 1) for _ in range(n_bits)]
+    rng = random
+    alice_bits  = np.fromiter((rng.randint(0, 1) for _ in range(n_bits)), dtype=np.int8)
+    alice_bases = np.fromiter((rng.randint(0, 1) for _ in range(n_bits)), dtype=np.int8)  # 0=Z, 1=X
+    bob_bases   = np.fromiter((rng.randint(0, 1) for _ in range(n_bits)), dtype=np.int8)
 
-    # 2) Preparazione stati (come prima)
-    circuits = []
-    for bit, basis in zip(alice_bits, alice_bases):
-        qc = QuantumCircuit(1, 1)
-        if bit == 1:
-            qc.x(0)
-        if basis == 1:
-            qc.h(0)
+    backend = _sim_for_noise(noise_level)
 
+    # --- detect max qubits available on this backend ---
+    try:
+        max_qubits = int(getattr(getattr(backend, "target", None), "num_qubits", None))  # qiskit >=1.0
+        if not max_qubits or max_qubits <= 0:
+            raise AttributeError
+    except Exception:
+        max_qubits = 28  # safe default under the reported 29 cap
+
+    # --- helper to run one chunk and return Bob's bits as np.array[0/1] ---
+    def run_chunk(a_bits: np.ndarray, a_bases: np.ndarray, b_bases: np.ndarray) -> np.ndarray:
+        m = a_bits.shape[0]
+        qc = QuantumCircuit(m, m)
+
+        # Alice preparation
+        for i in np.where(a_bits == 1)[0]:
+            qc.x(i)
+        for i in np.where(a_bases == 1)[0]:
+            qc.h(i)
+
+        # Eve disturbance (approximate, fast)
         if eve:
-            eve_basis = random.randint(0, 1)
-            if eve_basis == 1:
-                qc.h(0)
-            qc.measure(0, 0)
-            qc.reset(0)
-            measured_bit = random.randint(0, 1) if eve_basis != basis else bit
-            if measured_bit == 1:
-                qc.x(0)
-            if eve_basis == 1:
-                qc.h(0)
-        circuits.append(qc)
+            eve_bases = np.fromiter((rng.randint(0, 1) for _ in range(m)), dtype=np.int8)
+            # introduce flips with p=0.5 where bases differ (models intercept-resend disturbance)
+            for i in np.where(eve_bases != a_bases)[0]:
+                if rng.random() < 0.5:
+                    qc.x(i)
 
-    # 3) Rumore depolarizzante
-    noise = NoiseModel()
-    err1 = depolarizing_error(noise_level, 1)
-    for gate in ["x", "h", "id"]:
-        noise.add_all_qubit_quantum_error(err1, gate)
-    backend = AerSimulator(noise_model=noise)
+        # Bob rotates and measures
+        for i in np.where(b_bases == 1)[0]:
+            qc.h(i)
+        qc.measure(range(m), range(m))
 
-    # 4) Bob
-    bob_bases = [random.randint(0, 1) for _ in range(n_bits)]
-    bob_results = []
-    for i, qc in enumerate(circuits):
-        qcm = qc.copy()
-        if bob_bases[i] == 1:
-            qcm.h(0)
-        qcm.measure(0, 0)
-        result = backend.run(transpile(qcm, backend), shots=1).result()
-        bob_results.append(int(list(result.get_counts().keys())[0]))
+        tqc = transpile(qc, backend)
+        res = backend.run(tqc, shots=1, memory=True).result()
+        bits = res.get_memory()[0][::-1]  # reverse to align index→qubit
+        return (np.frombuffer(bits.encode(), dtype="S1").astype(np.uint8) - ord("0"))
 
-    # 5) Sifting
-    sifted_idx = [i for i in range(n_bits) if alice_bases[i] == bob_bases[i]]
-    if not sifted_idx:
+    # --- run in chunks and concatenate ---
+    bob_results_list: list[np.ndarray] = []
+    start = 0
+    while start < n_bits:
+        end = min(start + max_qubits, n_bits)
+        bob_results_list.append(
+            run_chunk(alice_bits[start:end], alice_bases[start:end], bob_bases[start:end])
+        )
+        start = end
+    bob_results = np.concatenate(bob_results_list, axis=0)
+
+    # --- sifting & QBER ---
+    mask = (alice_bases == bob_bases)
+    if not mask.any():
         return None, 1.0
 
-    # 6) QBER su campione (più stabile)
-    sample_size = max(3, len(sifted_idx) // 10)
-    sample_idx = random.sample(sifted_idx, k=min(sample_size, len(sifted_idx)))
-    errors = sum(int(alice_bits[j] != bob_results[j]) for j in sample_idx)
+    sift_idx = np.where(mask)[0]
+    sample_size = max(3, len(sift_idx) // 10)
+    sample_idx = rng.sample(list(sift_idx), k=min(sample_size, len(sift_idx)))
+    errors = int(np.sum(alice_bits[sample_idx] != bob_results[sample_idx]))
     qber = errors / len(sample_idx)
 
-    # 7) Gestione QBER alto
     if qber > qber_threshold:
         if raise_on_high_qber:
             raise ValueError(f"Eavesdropper/rumore eccessivo: QBER={qber:.2%}")
         return None, qber
 
-    # 8) Privacy amplification minimale
-    sifted_alice = [alice_bits[i] for i in sifted_idx]
-    sifted_bob   = [bob_results[i] for i in sifted_idx]
-    key_bits = [a for a, b in zip(sifted_alice, sifted_bob) if a == b]
+    # --- derive key (simple privacy amplification) ---
+    agree = (alice_bits[sift_idx] == bob_results[sift_idx])
+    key_bits = alice_bits[sift_idx][agree].tolist()
     if len(key_bits) < 8:
-        # Non abbastanza materiale
         return None, qber
-    raw_bytes = bits_to_bytes(key_bits[:256])
-    final_key = sha256(raw_bytes).digest()[:16]
-    return final_key, qber
+    raw = _bits_to_bytes(key_bits[:256])
+    key = sha256(raw).digest()[:16]
+    return key, qber
+
 
 
 # ------------------------ E91 (stub ragionato) ------------------------
