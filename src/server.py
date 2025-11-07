@@ -8,10 +8,15 @@ from flask_socketio import SocketIO, emit, join_room
 
 from network import build_network
 from crypto_utils import encrypt_gcm, decrypt_gcm
+import os
+
 
 app = Flask(__name__)
 # eventlet semplifica il websocket server
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+async_mode = os.getenv("ASYNC_MODE", "threading")  # "threading" or "eventlet"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
 
 # Crea rete demo (4 nodi completi)
 G, nodes = build_network(num_nodes=4)
@@ -94,5 +99,9 @@ def handle_decrypt(data):
 # ----------------------- main -----------------------
 
 if __name__ == "__main__":
-    # ssl_context='adhoc' genera un certificato self-signed temporaneo (solo demo!)
-    socketio.run(app, port=5000, ssl_context="adhoc")
+    if async_mode == "eventlet":
+        # HTTP only unless you pass cert/key (see Option A)
+        socketio.run(app, host="0.0.0.0", port=5000)
+    else:
+        # Werkzeug supports ssl_context
+        socketio.run(app, host="0.0.0.0", port=5000, ssl_context="adhoc")
