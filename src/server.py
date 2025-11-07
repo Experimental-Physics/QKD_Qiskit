@@ -1,165 +1,301 @@
 # server.py
 from __future__ import annotations
+import asyncio
 import binascii
-from typing import Dict
-
-from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit, join_room
-
-from network import build_network
-from crypto_utils import encrypt_gcm, decrypt_gcm
 import os
-from flask import Flask, request, jsonify
-from qkd import bb84_key_generation
+from typing import Dict, List, Optional
 
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, conint, confloat
+import uvicorn
 
-app = Flask(__name__)
-# eventlet semplifica il websocket server
-socketio = SocketIO(app, cors_allowed_origins="*")
+from network import build_network, QKDNode, NetworkState
+from crypto_utils import encrypt_gcm, decrypt_gcm
+from qkd import bb84_key_generation, e91_key_generation
 
-async_mode = os.getenv("ASYNC_MODE", "threading")  # "threading" or "eventlet"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
+# =========================
+# FastAPI setup
+# =========================
+app = FastAPI(title="QKD Playground API", version="1.0.0", description="""
+Agnostic backend for QKD demos.
+- REST for data/sweeps/management
+- WebSocket for chat & live protocol traces
+""")
 
-# Crea rete demo (4 nodi completi)
-G, nodes = build_network(num_nodes=4)
+# CORS wide open by default (restrict in prod)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
-# ----------------------- REST: metriche -----------------------
+# =========================
+# Global in-memory state
+# =========================
+STATE: NetworkState = build_network(num_nodes=2)
 
-@app.get("/metrics/<int:node_id>")
+# =========================
+# WebSocket connection manager
+# =========================
+class ConnectionManager:
+    def __init__(self):
+        # room per node_id -> set of websockets
+        self.rooms: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, ws: WebSocket, room: str):
+        await ws.accept()
+        self.rooms.setdefault(room, []).append(ws)
+
+    def _prune(self, room: str):
+        self.rooms[room] = [w for w in self.rooms.get(room, []) if not w.client_state.name == "DISCONNECTED"]
+
+    async def disconnect(self, ws: WebSocket, room: str):
+        try:
+            self.rooms.get(room, []).remove(ws)
+        except ValueError:
+            pass
+        self._prune(room)
+
+    async def send_room(self, room: str, payload: dict):
+        for ws in list(self.rooms.get(room, [])):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                await self.disconnect(ws, room)
+
+    async def broadcast(self, payload: dict):
+        for room in list(self.rooms.keys()):
+            await self.send_room(room, payload)
+
+manager = ConnectionManager()
+
+# =========================
+# Pydantic models
+# =========================
+class RebuildReq(BaseModel):
+    num_nodes: conint(ge=2) = 4
+    noise_min: confloat(ge=0.0) = 0.0
+    noise_max: confloat(ge=0.0) = 0.05
+    eve_prob: confloat(ge=0.0, le=1.0) = 0.0
+    protocol: str = Field("bb84", description="bb84|e91|mixed")
+
+class SweepResp(BaseModel):
+    noise: List[float]
+    qber: List[float]
+    success: List[bool]
+
+class SweepParams(BaseModel):
+    noise_min: confloat(ge=0.0) = 0.0
+    noise_max: confloat(ge=0.0) = 0.12
+    num: conint(ge=2, le=400) = 25
+    n_bits: conint(ge=8, le=8192) = 256
+    eve: bool = False
+    protocol: str = "bb84"
+
+class EstablishReq(BaseModel):
+    src: conint(ge=0)
+    dst: conint(ge=0)
+    protocol: str = "bb84"
+    n_bits: conint(ge=8, le=8192) = 256
+    noise: confloat(ge=0.0) = 0.02
+    eve_prob: confloat(ge=0.0, le=1.0) = 0.0
+    qber_threshold: confloat(ge=0.0, le=0.5) = 0.11
+
+class ChatSend(BaseModel):
+    sender: conint(ge=0)
+    receiver: conint(ge=0)
+    message: str
+
+class DecryptReq(BaseModel):
+    owner: conint(ge=0)
+    peer: conint(ge=0)
+    blob_hex: str
+
+class WorkbenchReq(BaseModel):
+    protocol: str = Field("bb84", description="bb84|e91")
+    key_len: conint(ge=8, le=4096) = 64
+    noise: confloat(ge=0.0, le=1.0) = 0.0
+    eve_prob: confloat(ge=0.0, le=1.0) = 0.0
+    sample_frac: confloat(gt=0.0, le=0.9) = 0.5
+    seed: Optional[int] = None
+
+# =========================
+# Health & basic info
+# =========================
+@app.get("/health")
+def health():
+    return {"ok": True, "nodes": len(STATE.nodes)}
+
+@app.get("/network")
+def get_network():
+    return {
+        "num_nodes": len(STATE.nodes),
+        "edges": list(STATE.graph.edges),
+        "keys": {u: list(n.keys.keys()) for u, n in STATE.nodes.items()},
+        "metrics": {u: n.metrics for u, n in STATE.nodes.items()},
+    }
+
+@app.get("/metrics/{node_id}")
 def get_metrics(node_id: int):
-    if node_id not in nodes:
-        return jsonify({"error": "node not found"}), 404
-    return jsonify(nodes[node_id].metrics)
+    if node_id not in STATE.nodes:
+        return JSONResponse({"error": "node not found"}, status_code=404)
+    return STATE.nodes[node_id].metrics
 
-# ----------------------- Socket.IO: chat sicura -----------------------
-
-# I client devono chiamare questo per entrare nella "stanza" del proprio ID
-@socketio.on("join")
-def on_join(data):
-    """
-    data = {"node_id": int}
-    """
-    node_id = int(data.get("node_id", -1))
-    if node_id not in nodes:
-        emit("error", {"msg": "Unknown node_id"})
-        return
-    join_room(str(node_id))
-    emit("joined", {"room": str(node_id)})
-
-@socketio.on("message")
-def handle_message(data):
-    """
-    data = {"sender": int, "receiver": int, "msg": str}
-    """
-    try:
-        sender = int(data["sender"])
-        receiver = int(data["receiver"])
-        msg = str(data["msg"])
-    except Exception:
-        emit("error", {"msg": "Invalid payload"})
-        return
-
-    if receiver not in nodes[sender].keys:
-        emit("error", {"msg": "No secure channel with receiver"})
-        return
-
-    key, _, _ = nodes[sender].keys[receiver]
-    blob = encrypt_gcm(msg.encode("utf-8"), key)
-    # invio nella stanza del receiver
-    emit("secure_msg",
-         {"sender": sender, "blob_hex": binascii.hexlify(blob).decode()},
-         room=str(receiver))
-
-@socketio.on("decrypt")
-def handle_decrypt(data):
-    """
-    data = {"owner": int, "peer": int, "blob_hex": str}
-    Il client può chiedere di decifrare (per test/UX): il server verifica di avere la chiave
-    dal punto di vista di 'owner' verso 'peer', e restituisce il plaintext.
-    """
-    try:
-        owner = int(data["owner"])
-        peer = int(data["peer"])
-        blob = binascii.unhexlify(data["blob_hex"])
-    except Exception:
-        emit("error", {"msg": "Invalid payload"})
-        return
-
-    if peer not in nodes[owner].keys:
-        emit("error", {"msg": "No secure channel"})
-        return
-
-    key, _, _ = nodes[owner].keys[peer]
-    try:
-        pt = decrypt_gcm(blob, key)
-    except Exception as e:
-        emit("error", {"msg": f"Decryption failed: {e}"})
-        return
-
-    emit("plaintext", {"owner": owner, "peer": peer, "text": pt.decode("utf-8")})
-
-
-# ----------------------- Admin: rebuild network -----------------------
-@app.post("/rebuild")
-def rebuild_network():
-    """
-    Rebuild the QKD network with a new number of nodes (and optional noise/eve params).
-    Body JSON: {"num_nodes": 6, "noise_range":[0.0,0.05], "eve_prob":0.0}
-    """
-    data = request.get_json(silent=True) or {}
-    num_nodes  = int(data.get("num_nodes", 4))
-    noise_rng  = data.get("noise_range", [0.0, 0.05])
-    eve_prob   = float(data.get("eve_prob", 0.0))
-    if not (isinstance(noise_rng, (list, tuple)) and len(noise_rng) == 2):
-        return jsonify({"error": "noise_range must be [min,max]"}), 400
-
-    global G, nodes
-    G, nodes = build_network(num_nodes=num_nodes,
-                             noise_range=(float(noise_rng[0]), float(noise_rng[1])),
-                             eve_prob=eve_prob)
-    return jsonify({"ok": True, "num_nodes": num_nodes})
-
-
-# ----------------------- Analysis: QBER sweep vs noise -----------------------
-@app.get("/sweep_bb84")
-def sweep_bb84():
-    """
-    Run a BB84 sweep over noise ∈ [noise_min, noise_max], sampled 'num' points.
-    Query args: ?noise_min=0.0&noise_max=0.12&num=25&n_bits=256&eve=0
-    Returns: {"noise":[...], "qber":[...], "success":[...]}
-    """
-    try:
-        noise_min = float(request.args.get("noise_min", 0.0))
-        noise_max = float(request.args.get("noise_max", 0.12))
-        num       = int(request.args.get("num", 25))
-        n_bits    = int(request.args.get("n_bits", 256))
-        eve       = request.args.get("eve", "0") in ("1", "true", "True")
-    except Exception as e:
-        return jsonify({"error": f"bad params: {e}"}), 400
-
-    if num < 2:
-        return jsonify({"error": "num must be >= 2"}), 400
-
-    xs = [noise_min + i*(noise_max-noise_min)/(num-1) for i in range(num)]
-    qbers = []
-    succ  = []
+# =========================
+# Section 1 — Sweep QBER vs Noise
+# =========================
+@app.post("/sweep", response_model=SweepResp)
+def sweep(params: SweepParams):
+    xs = [params.noise_min + i*(params.noise_max-params.noise_min)/(params.num-1) for i in range(params.num)]
+    qbers, succ = [], []
 
     for p in xs:
-        key, qber = bb84_key_generation(n_bits=n_bits,
-                                        noise_level=p,
-                                        eve=eve,
-                                        raise_on_high_qber=False)
+        if params.protocol.lower() == "e91":
+            key, qber = e91_key_generation(n_bits=params.n_bits)
+        else:
+            key, qber = bb84_key_generation(
+                n_bits=params.n_bits, noise_level=p, eve=params.eve, raise_on_high_qber=False
+            )
         qbers.append(qber)
         succ.append(bool(key))
 
-    return jsonify({"noise": xs, "qber": qbers, "success": succ})
+    return SweepResp(noise=xs, qber=qbers, success=succ)
 
-# ----------------------- main -----------------------
+# =========================
+# Section 2 — Network simulator + Secure Chat
+# =========================
+@app.post("/rebuild")
+def rebuild(req: RebuildReq):
+    global STATE
+    protocol_choice = req.protocol.lower()
+    STATE = build_network(
+        num_nodes=req.num_nodes,
+        noise_range=(req.noise_min, req.noise_max),
+        eve_prob=req.eve_prob,
+        default_protocol=protocol_choice,
+    )
+    return {"ok": True, "num_nodes": req.num_nodes}
 
-if __name__ == "__main__":
-    if async_mode == "eventlet":
-        # HTTP only unless you pass cert/key (see Option A)
-        socketio.run(app, host="0.0.0.0", port=5000)
+@app.post("/establish")
+def establish(req: EstablishReq):
+    if req.src not in STATE.nodes or req.dst not in STATE.nodes:
+        return JSONResponse({"error": "unknown node"}, status_code=404)
+
+    key, qber, proto = STATE.nodes[req.src].establish_key(
+        neighbor=req.dst,
+        protocol=req.protocol,
+        n_bits=req.n_bits,
+        noise=req.noise,
+        eve_prob=req.eve_prob,
+        qber_threshold=req.qber_threshold
+    )
+    if key is None:
+        return {"ok": False, "qber": qber, "protocol": proto, "message": "QBER too high or failed"}
+    return {"ok": True, "qber": qber, "protocol": proto}
+
+@app.post("/chat/send")
+async def chat_send(payload: ChatSend):
+    s = payload.sender
+    r = payload.receiver
+    if s not in STATE.nodes or r not in STATE.nodes:
+        return JSONResponse({"error": "unknown node"}, status_code=404)
+    if r not in STATE.nodes[s].keys:
+        return JSONResponse({"error": "no secure channel"}, status_code=400)
+
+    key, _, _ = STATE.nodes[s].keys[r]
+    blob = encrypt_gcm(payload.message.encode("utf-8"), key)
+    blob_hex = binascii.hexlify(blob).decode()
+
+    # push to receiver room over WS
+    await manager.send_room(str(r), {
+        "type": "secure_msg",
+        "sender": s,
+        "blob_hex": blob_hex
+    })
+    # also echo to sender room as delivery confirmation
+    await manager.send_room(str(s), {
+        "type": "delivered",
+        "to": r,
+        "blob_hex": blob_hex
+    })
+    return {"ok": True}
+
+@app.post("/chat/decrypt")
+def chat_decrypt(payload: DecryptReq):
+    o = payload.owner
+    p = payload.peer
+    if o not in STATE.nodes or p not in STATE.nodes:
+        return JSONResponse({"error": "unknown node"}, status_code=404)
+    if p not in STATE.nodes[o].keys:
+        return JSONResponse({"error": "no secure channel"}, status_code=400)
+    key, _, _ = STATE.nodes[o].keys[p]
+    try:
+        pt = decrypt_gcm(binascii.unhexlify(payload.blob_hex), key)
+    except Exception as e:
+        return JSONResponse({"error": f"decrypt failed: {e}"}, status_code=400)
+    return {"ok": True, "plaintext": pt.decode("utf-8")}
+
+# =========================
+# Section 3 — Protocol Workbench (step trace)
+# =========================
+@app.post("/workbench/run")
+def workbench_run(req: WorkbenchReq):
+    """
+    Ritorna una TRACE dettagliata (adatta a un timeline viewer nel frontend):
+    - alice_bits, alice_bases, bob_bases
+    - bob_results
+    - sift_mask indices
+    - sample_indices per stima QBER
+    - qber, final_key_bits (post sample removal)
+    """
+    from workbench import run_bb84_trace, run_e91_trace
+    if req.protocol.lower() == "e91":
+        trace = run_e91_trace(key_len=req.key_len, seed=req.seed)
     else:
-        # Werkzeug supports ssl_context
-        socketio.run(app, host="0.0.0.0", port=5000, ssl_context="adhoc")
+        trace = run_bb84_trace(
+            key_len=req.key_len, noise_level=req.noise,
+            eve_prob=req.eve_prob, sample_frac=req.sample_frac, seed=req.seed
+        )
+    return trace
+
+# =========================
+# WebSocket endpoint (generic)
+# =========================
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    Client protocol (simple JSON):
+    - {"action":"join","room":"<node_id or arbitrary>"}
+    - {"action":"send","room":"<room>","payload":{...}}  # echo to all in room
+    """
+    room = None
+    await websocket.accept()
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            action = msg.get("action")
+            if action == "join":
+                room = str(msg.get("room", "lobby"))
+                await manager.connect(websocket, room)
+                await manager.send_room(room, {"type": "joined", "room": room})
+            elif action == "send":
+                target = str(msg.get("room", "lobby"))
+                payload = msg.get("payload", {})
+                await manager.send_room(target, {"type": "event", "payload": payload})
+            else:
+                await websocket.send_json({"type": "error", "message": "unknown action"})
+    except WebSocketDisconnect:
+        if room:
+            await manager.disconnect(websocket, room)
+    except Exception as e:
+        if room:
+            await manager.send_room(room, {"type": "error", "message": str(e)})
+
+# =========================
+# Dev entry
+# =========================
+if __name__ == "__main__":
+    # HTTPS dev: pass --ssl-keyfile/--ssl-certfile to uvicorn if needed
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
