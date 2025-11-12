@@ -1,6 +1,6 @@
 ## Overview
 
-This repository provides a simulation framework for a network of n-nodes HTTPS servers that incorporate quantum key distribution (QKD) for secure encryption. The framework leverages Qiskit, IBM's open-source quantum computing software development kit, to simulate quantum protocols for key generation. Specifically, it implements two prominent QKD protocols: BB84 (Bennett-Brassard 1984) and E91 (Ekert 1991, often referred to as E94 in some contexts due to typographical variations, but standardized as E91).
+This repository provides a simulation framework for a network of n-nodes HTTPS servers that incorporate quantum key distribution (QKD) for secure encryption. The framework leverages Qiskit, IBM's open-source quantum computing software development kit, to simulate quantum protocols for key generation. Specifically, it implements two prominent QKD protocols: BB84 (Bennett-Brassard 1984) and E91 (Ekert 1991).
 
 The project aims to demonstrate how quantum-secure keys can be integrated into classical network communication, such as HTTPS servers, to enhance security against potential quantum threats like Shor's algorithm. This is particularly useful for educational purposes, research in quantum cryptography, and prototyping quantum-enhanced network systems.
 
@@ -55,12 +55,12 @@ The repository is organized as follows:
 
 - **`examples/`**: Sample scripts and Jupyter notebooks.
   - `bb84_example.ipynb`: Jupyter notebook demonstrating a standalone BB84 simulation.
-  - `e91_example.ipynb`: Jupyter notebook for E91 protocol with entanglement-based key distribution.
+  - `E91_example.ipynb`: Jupyter notebook for E91 protocol with entanglement-based key distribution.
   - `network_demo.py`: Script to run a multi-node HTTPS server network simulation.
 
 - **`tests/`**: Unit tests for protocols and utilities.
   - `test_bb84.py`: Tests for BB84 implementation.
-  - `test_e91.py`: Tests for E91 implementation.
+  - `test_E91.py`: Tests for E91 implementation.
 
 - **`docs/`**: Additional documentation.
   - `protocol_details.md`: In-depth explanation of BB84 and E91.
@@ -81,7 +81,7 @@ The repository is organized as follows:
 
 2. For E91:
    ```
-   python examples/e91_example.py
+   python examples/E91_example.py
    ```
    Similarly, use the Jupyter notebook for visualization.
 
@@ -99,7 +99,7 @@ To simulate an n-node HTTPS network:
    ```
    Options:
    - `--nodes N`: Number of nodes (default: 2).
-   - `--protocol {bb84, e91}`: Choose the QKD protocol.
+   - `--protocol {bb84, E91}`: Choose the QKD protocol.
    - `--noise-level FLOAT`: Simulate channel noise (default: 0.0).
    - `--eavesdrop`: Enable eavesdropping simulation.
 
